@@ -40,17 +40,20 @@ __global__ void conv3d_my_global_lds_kernel(
   const int b_idx = blockIdx.z;
   const int h_idx = blockIdx.x;
   const int outgrp_idx = blockIdx.y;
+
   const int tx = threadIdx.x;
   const int wave_idx = tx / 64;
   const int wave_tx = tx % 64;
+  const int wgrp = tx / 320;
+  const int wgrp_tx = tx % 320;
 
-  // zero pad group filters tail bytes once
-  for (int pid = tx; pid < kChannelsPerOutGroup * (kFilterPadded - kFilter); pid += kBlockSize) {
-    const int c_idx = pid / (kFilterPadded - kFilter);
-    const int col = kFilter + (pid % (kFilterPadded - kFilter));
-    filters[c_idx][col] = 0;
-  }
-  // __syncthreads();
+  // // zero pad group filters tail bytes once
+  // for (int pid = tx; pid < kChannelsPerOutGroup * (kFilterPadded - kFilter); pid += kBlockSize) {
+  //   const int c_idx = pid / (kFilterPadded - kFilter);
+  //   const int col = kFilter + (pid % (kFilterPadded - kFilter));
+  //   filters[c_idx][col] = 0;
+  // }
+  // // __syncthreads();
 
   // loop over all 128 input channels
   for (int cin_idx = 0; cin_idx < kNumC; ++cin_idx) {
