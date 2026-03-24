@@ -1,0 +1,310 @@
+/**
+ * CK grouped conv3d BF16 launcher.
+ * Explicit DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_V3 configs from
+ * device_grouped_conv_fwd_xdl_mem_instance.hpp (BF16, Intrawave/Interwave, pipeline v2).
+ *
+ * Launches CK's kernel_grouped_conv_fwd_xdl_cshuffle_v3 and CK elementwise transpose
+ * kernels internally (NGCDHW path). rocprof may also show MIOpen batched_transpose_* when
+ * using torch.nn.conv3d — different module, same math vs F.conv3d in BF16.
+ */
+
+#include "conv3d_ck_launch.h"
+
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
+
+#include <array>
+#include <cstdint>
+#include <stdexcept>
+
+#include "ck/ck.hpp"
+#include "ck/stream_config.hpp"
+#include "ck/tensor_operation/gpu/device/convolution_forward_specialization.hpp"
+#include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
+#include "ck/tensor_operation/gpu/device/impl/device_grouped_conv_fwd_multiple_abd_xdl_cshuffle_v3.hpp"
+#include "ck/tensor_operation/gpu/device/tensor_layout.hpp"
+#include "ck/tensor_operation/gpu/element/element_wise_operation.hpp"
+
+using ck::index_t;
+using ck::tensor_layout::convolution::GKCZYX;
+using ck::tensor_layout::convolution::NGCDHW;
+using ck::tensor_layout::convolution::NGKDHW;
+
+namespace {
+
+// Same formula as ck::utils::conv::ConvParam ctor (stride/dilation per spatial dim).
+inline int64_t conv_output_spatial_len(
+    int64_t in_len,
+    int64_t filter_len,
+    int64_t left_pad,
+    int64_t right_pad,
+    int64_t stride,
+    int64_t dilation) {
+  const int64_t x_eff = (filter_len - 1) * dilation + 1;
+  return (in_len + left_pad + right_pad - x_eff) / stride + 1;
+}
+
+// Row-major strides for lens[0..5] with dim 5 innermost (matches CK HostTensorDescriptor).
+void row_major_strides_6(const std::array<index_t, 6>& len, std::array<index_t, 6>& strides) {
+  strides[5] = 1;
+  for (int i = 4; i >= 0; --i) {
+    strides[static_cast<size_t>(i)] =
+        strides[static_cast<size_t>(i + 1)] * len[static_cast<size_t>(i + 1)];
+  }
+}
+
+// Same as ck::utils::conv::make_input_host_tensor_descriptor_g_n_c_wis_packed<NGCDHW> for G>=1:
+// physical order [N,G,C,D,H,W] then transpose indices {1,0,2,3,4,5}.
+void fill_ngcdhw_packed(
+    index_t N,
+    index_t G,
+    index_t C,
+    index_t D,
+    index_t H,
+    index_t W,
+    std::array<index_t, 6>& lens,
+    std::array<index_t, 6>& strides) {
+  const std::array<index_t, 6> phys{N, G, C, D, H, W};
+  std::array<index_t, 6> pstr{};
+  row_major_strides_6(phys, pstr);
+  constexpr int k_map[6] = {1, 0, 2, 3, 4, 5};
+  for (int i = 0; i < 6; ++i) {
+    const int j = k_map[i];
+    lens[static_cast<size_t>(i)] = phys[static_cast<size_t>(j)];
+    strides[static_cast<size_t>(i)] = pstr[static_cast<size_t>(j)];
+  }
+}
+
+// Same as make_weight_host_tensor_descriptor_g_k_c_xs_packed<GKCZYX>: [G,K,C,Z,Y,X], no transpose.
+void fill_gkczyx_packed(
+    index_t G,
+    index_t K,
+    index_t C,
+    index_t Z,
+    index_t Y,
+    index_t X,
+    std::array<index_t, 6>& lens,
+    std::array<index_t, 6>& strides) {
+  lens = {G, K, C, Z, Y, X};
+  row_major_strides_6(lens, strides);
+}
+
+// Same as make_output_host_tensor_descriptor_g_n_k_wos_packed<NGKDHW>: [N,G,K,D,H,W] then
+// transpose {1,0,2,3,4,5}.
+void fill_ngkdhw_packed(
+    index_t N,
+    index_t G,
+    index_t K,
+    index_t D,
+    index_t H,
+    index_t W,
+    std::array<index_t, 6>& lens,
+    std::array<index_t, 6>& strides) {
+  const std::array<index_t, 6> phys{N, G, K, D, H, W};
+  std::array<index_t, 6> pstr{};
+  row_major_strides_6(phys, pstr);
+  constexpr int k_map[6] = {1, 0, 2, 3, 4, 5};
+  for (int i = 0; i < 6; ++i) {
+    const int j = k_map[i];
+    lens[static_cast<size_t>(i)] = phys[static_cast<size_t>(j)];
+    strides[static_cast<size_t>(i)] = pstr[static_cast<size_t>(j)];
+  }
+}
+
+}  // namespace
+using ck::tensor_operation::device::ConvolutionForwardSpecialization;
+using ck::tensor_operation::device::DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_V3;
+using ck::tensor_operation::device::GemmSpecialization;
+using ck::tensor_operation::element_wise::PassThrough;
+
+using BF16 = ck::bhalf_t;
+using F32 = float;
+using Empty_Tuple = ck::Tuple<>;
+template <ck::index_t... Is>
+using S = ck::Sequence<Is...>;
+
+// Single-token aliases — cannot pass comma-filled templates into a macro parameter.
+//
+// MIOpen (nn Conv3d) on MI300 often picks this tile for the same problem: Block 256, M/N per
+// block 128×128, KPer 64, MXdl/NXdl 2×2 — see kernel_grouped_conv_fwd_xdl_cshuffle_v3 symbol
+// (ELi256ELi128ELi128ELi64…ELi2ELi2…) in trace_bf16.json vs our older 256×32 / NXdl=1 instance.
+using CkBf16Conv256_128x128_MIOpenLike_Intra = DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_V3<
+    3, NGCDHW, GKCZYX, Empty_Tuple, NGKDHW, BF16, BF16, F32, BF16, Empty_Tuple, BF16, PassThrough,
+    PassThrough, PassThrough, ConvolutionForwardSpecialization::Default, GemmSpecialization::MNKPadding,
+    256, 128, 128, 64, 8, 8, 32, 32, 2, 2, S<8, 32, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, 0,
+    S<8, 32, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, 0, 1, 1, S<1, 32, 1, 8>, 4,
+    ck::BlockGemmPipelineScheduler::Intrawave, ck::BlockGemmPipelineVersion::v2>;
+using CkBf16Conv256Intra = DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_V3<
+    3, NGCDHW, GKCZYX, Empty_Tuple, NGKDHW, BF16, BF16, F32, BF16, Empty_Tuple, BF16, PassThrough,
+    PassThrough, PassThrough, ConvolutionForwardSpecialization::Default, GemmSpecialization::MNKPadding,
+    256, 256, 32, 64, 8, 8, 32, 32, 2, 1, S<8, 32, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, 0,
+    S<8, 32, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, 0, 1, 1, S<1, 32, 1, 8>, 4,
+    ck::BlockGemmPipelineScheduler::Intrawave, ck::BlockGemmPipelineVersion::v2>;
+using CkBf16Conv128Intra = DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_V3<
+    3, NGCDHW, GKCZYX, Empty_Tuple, NGKDHW, BF16, BF16, F32, BF16, Empty_Tuple, BF16, PassThrough,
+    PassThrough, PassThrough, ConvolutionForwardSpecialization::Default, GemmSpecialization::MNKPadding,
+    128, 128, 32, 64, 8, 8, 32, 32, 2, 1, S<8, 16, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, 0,
+    S<8, 16, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, 0, 1, 1, S<1, 16, 1, 8>, 4,
+    ck::BlockGemmPipelineScheduler::Intrawave, ck::BlockGemmPipelineVersion::v2>;
+using CkBf16Conv256_64_128_Intra = DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_V3<
+    3, NGCDHW, GKCZYX, Empty_Tuple, NGKDHW, BF16, BF16, F32, BF16, Empty_Tuple, BF16, PassThrough,
+    PassThrough, PassThrough, ConvolutionForwardSpecialization::Default, GemmSpecialization::MNKPadding,
+    256, 64, 128, 64, 8, 8, 32, 32, 1, 2, S<8, 32, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, 0,
+    S<8, 32, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, 0, 1, 1, S<1, 32, 1, 8>, 8,
+    ck::BlockGemmPipelineScheduler::Intrawave, ck::BlockGemmPipelineVersion::v2>;
+using CkBf16Conv256Inter = DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_V3<
+    3, NGCDHW, GKCZYX, Empty_Tuple, NGKDHW, BF16, BF16, F32, BF16, Empty_Tuple, BF16, PassThrough,
+    PassThrough, PassThrough, ConvolutionForwardSpecialization::Default, GemmSpecialization::MNKPadding,
+    256, 256, 32, 64, 8, 8, 32, 32, 2, 1, S<8, 32, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, 0,
+    S<8, 32, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, 0, 1, 1, S<1, 32, 1, 8>, 4,
+    ck::BlockGemmPipelineScheduler::Interwave, ck::BlockGemmPipelineVersion::v2>;
+using CkBf16Conv128Inter = DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_V3<
+    3, NGCDHW, GKCZYX, Empty_Tuple, NGKDHW, BF16, BF16, F32, BF16, Empty_Tuple, BF16, PassThrough,
+    PassThrough, PassThrough, ConvolutionForwardSpecialization::Default, GemmSpecialization::MNKPadding,
+    128, 128, 32, 64, 8, 8, 32, 32, 2, 1, S<8, 16, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, 0,
+    S<8, 16, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, 0, 1, 1, S<1, 16, 1, 8>, 4,
+    ck::BlockGemmPipelineScheduler::Interwave, ck::BlockGemmPipelineVersion::v2>;
+
+torch::Tensor conv3d_bf16_ck_forward(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    int64_t pad_left_d,
+    int64_t pad_left_h,
+    int64_t pad_left_w,
+    int64_t pad_right_d,
+    int64_t pad_right_h,
+    int64_t pad_right_w) {
+  TORCH_CHECK(input.is_cuda() && weight.is_cuda(), "CK conv: CUDA/ROCm tensors required");
+  TORCH_CHECK(input.scalar_type() == at::kBFloat16 && weight.scalar_type() == at::kBFloat16,
+              "CK conv: bfloat16 only");
+  TORCH_CHECK(input.dim() == 5 && weight.dim() == 5, "CK conv: expected 5D input and weight");
+  TORCH_CHECK(input.is_contiguous() && weight.is_contiguous(), "CK conv: contiguous tensors only");
+
+  const int64_t N = input.size(0);
+  const int64_t C = input.size(1);
+  const int64_t Di = input.size(2);
+  const int64_t Hi = input.size(3);
+  const int64_t Wi = input.size(4);
+  const int64_t K = weight.size(0);
+  TORCH_CHECK(weight.size(1) == C, "CK conv: weight K,C mismatch");
+  const int64_t kD = weight.size(2);
+  const int64_t kH = weight.size(3);
+  const int64_t kW = weight.size(4);
+
+  TORCH_CHECK(pad_left_d >= 0 && pad_left_h >= 0 && pad_left_w >= 0, "CK conv: left pad >= 0");
+  TORCH_CHECK(pad_right_d >= 0 && pad_right_h >= 0 && pad_right_w >= 0, "CK conv: right pad >= 0");
+
+  constexpr int64_t conv_stride = 1;
+  constexpr int64_t conv_dilation = 1;
+  const int64_t Do = conv_output_spatial_len(
+      Di, kD, pad_left_d, pad_right_d, conv_stride, conv_dilation);
+  const int64_t Ho = conv_output_spatial_len(
+      Hi, kH, pad_left_h, pad_right_h, conv_stride, conv_dilation);
+  const int64_t Wo = conv_output_spatial_len(
+      Wi, kW, pad_left_w, pad_right_w, conv_stride, conv_dilation);
+  TORCH_CHECK(Do > 0 && Ho > 0 && Wo > 0, "CK conv: computed output spatial size must be positive");
+
+  auto opts = input.options();
+  torch::Tensor output = torch::empty({N, K, Do, Ho, Wo}, opts);
+
+  constexpr index_t G = 1;
+  std::array<index_t, 6> a_lens{};
+  std::array<index_t, 6> a_strides{};
+  std::array<index_t, 6> b_lens{};
+  std::array<index_t, 6> b_strides{};
+  std::array<index_t, 6> e_lens{};
+  std::array<index_t, 6> e_strides{};
+  fill_ngcdhw_packed(
+      static_cast<index_t>(N),
+      G,
+      static_cast<index_t>(C),
+      static_cast<index_t>(Di),
+      static_cast<index_t>(Hi),
+      static_cast<index_t>(Wi),
+      a_lens,
+      a_strides);
+  fill_gkczyx_packed(
+      G,
+      static_cast<index_t>(K),
+      static_cast<index_t>(C),
+      static_cast<index_t>(kD),
+      static_cast<index_t>(kH),
+      static_cast<index_t>(kW),
+      b_lens,
+      b_strides);
+  fill_ngkdhw_packed(
+      static_cast<index_t>(N),
+      G,
+      static_cast<index_t>(K),
+      static_cast<index_t>(Do),
+      static_cast<index_t>(Ho),
+      static_cast<index_t>(Wo),
+      e_lens,
+      e_strides);
+
+  std::array<index_t, 3> conv_strides = {1, 1, 1};
+  std::array<index_t, 3> conv_dilations = {1, 1, 1};
+  std::array<index_t, 3> in_left_pad_i = {
+      static_cast<index_t>(pad_left_d),
+      static_cast<index_t>(pad_left_h),
+      static_cast<index_t>(pad_left_w)};
+  std::array<index_t, 3> in_right_pad_i = {
+      static_cast<index_t>(pad_right_d),
+      static_cast<index_t>(pad_right_h),
+      static_cast<index_t>(pad_right_w)};
+
+  const void* p_a = input.data_ptr();
+  const void* p_b = weight.data_ptr();
+  void* p_e = output.data_ptr();
+
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream(input.get_device()).stream();
+
+// Macro takes a single identifier (the typedef above). Commas inside templates break RUN_WITH_OP(Op).
+#define RUN_CK_DEVICE_OP(DevOpType)                                                                \
+  do {                                                                                             \
+    DevOpType ck_dev_op;                                                                           \
+    auto arg = ck_dev_op.MakeArgumentPointer(                                                      \
+        p_a,                                                                                       \
+        p_b,                                                                                       \
+        std::array<const void*, 0>{},                                                              \
+        p_e,                                                                                       \
+        a_lens,                                                                                    \
+        a_strides,                                                                                 \
+        b_lens,                                                                                    \
+        b_strides,                                                                                 \
+        std::array<std::array<index_t, 6>, 0>{},                                                   \
+        std::array<std::array<index_t, 6>, 0>{},                                                   \
+        e_lens,                                                                                    \
+        e_strides,                                                                                 \
+        conv_strides,                                                                              \
+        conv_dilations,                                                                            \
+        in_left_pad_i,                                                                             \
+        in_right_pad_i,                                                                            \
+        PassThrough{},                                                                             \
+        PassThrough{},                                                                             \
+        PassThrough{});                                                                            \
+    /* NGCDHW/GKCZYX/NGKDHW: IsSupportedArgument requires p_workspace_ set (see CK v3 impl). */    \
+    std::size_t ws_bytes = ck_dev_op.GetWorkSpaceSize(arg.get());                                  \
+    const int64_t ws_alloc = static_cast<int64_t>(ws_bytes > 0 ? ws_bytes : 1);                    \
+    torch::Tensor ws_tensor = torch::empty({ws_alloc}, input.options().dtype(at::kByte));          \
+    void* ws_ptr = ws_tensor.data_ptr();                                                           \
+    ck_dev_op.SetWorkSpacePointer(arg.get(), ws_ptr);                                              \
+    if (ck_dev_op.IsSupportedArgument(arg.get())) {                                                \
+      ck_dev_op.MakeInvokerPointer()->Run(arg.get(), StreamConfig{stream, false, 0, 0, 1, false}); \
+      return output;                                                                               \
+    }                                                                                              \
+  } while (0)
+
+  RUN_CK_DEVICE_OP(CkBf16Conv256_128x128_MIOpenLike_Intra);
+  RUN_CK_DEVICE_OP(CkBf16Conv256Intra);
+  RUN_CK_DEVICE_OP(CkBf16Conv128Intra);
+  RUN_CK_DEVICE_OP(CkBf16Conv256_64_128_Intra);
+  RUN_CK_DEVICE_OP(CkBf16Conv256Inter);
+  RUN_CK_DEVICE_OP(CkBf16Conv128Inter);
+
+#undef RUN_CK_DEVICE_OP
+
+  throw std::runtime_error(
+      "conv3d_bf16_ck_forward: no CK DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_V3 instance "
+      "accepted this problem. Add more tile configs or link full CK instance library.");
+}

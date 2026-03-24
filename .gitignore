@@ -1,0 +1,64 @@
+# ROCm / rocprof
+.rocprofv3/
+rocprof_out/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+venv/
+.venv/
+env/
+.env
+.env.*
+*.egg-info/
+.eggs/
+dist/
+pip-wheel-metadata/
+*.egg
+
+# Extension / native build trees (setuptools, torch.utils.cpp_extension)
+**/build/
+*.so
+*.o
+*.a
+*.dylib
+*.dll
+*.lib
+*.exp
+*.pdb
+
+# CMake (if used)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Tools
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+
+# Logs
+*.log
