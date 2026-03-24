@@ -9,7 +9,17 @@
 #
 # Outputs: workload dir under rocprof_out/<WORKLOAD_NAME>/ (perfmon/, pmc CSVs,
 # profiling_config.yaml, summary_percentages.csv, analyze_tables/*.csv (kept by default), etc.).
+# Default WORKLOAD_NAME is <YYYYMMDD_HHMMSS> (local time). Override, e.g.:
+#   WORKLOAD_NAME=conv3_use_my_conv ./rocprof_use_my_conv.sh
 # After profile, runs rocprof-compute analyze (-b 2 10 11) and merges into summary_percentages.csv.
+#
+# Advanced Thread Trace for ROCprof Compute Viewer (ui_output_agent_*_dispatch_* dirs) runs after PMC profile:
+#   https://github.com/ROCm/rocprof-compute-viewer
+#   ROCPROF_NO_UI_TRACE=1 ./rocprof_use_my_conv.sh   # skip ATT pass (faster)
+#   ROCPROF_UI_TRACE_DIR=/path ./rocprof_use_my_conv.sh   # default: WORKLOAD_PATH/ui_thread_trace
+#   ROCPROF_UI_ATT_TARGET_CU=0 ROCPROF_UI_ATT_GPU_INDEX=0 ./rocprof_use_my_conv.sh   # optional ATT tuning
+#   ROCPROF_UI_ATT_LIBRARY_PATH=/path/to/decoder/dir ./rocprof_use_my_conv.sh   # override auto-detect (see below)
+#   ROCPROF_UI_ATT_SERIALIZE_ALL=1 ./rocprof_use_my_conv.sh   # optional; can help capture kernels on some systems
 #
 # Usage:
 #   conda activate <env with torch + rocprof-compute deps>   # important
@@ -17,9 +27,10 @@
 #   python3 rocprof_use_my_conv.py          # same as the shell script
 #   NO_CLEAN_ROCPROF_OUT=1 ./rocprof_use_my_conv.sh
 #   ROCPROF_NO_SUMMARY=1 ./rocprof_use_my_conv.sh   # skip analyze + summary CSV
+#   ROCPROF_NO_UI_TRACE=1 ./rocprof_use_my_conv.sh   # skip rocprofv3 ATT (ROCprof Compute Viewer data)
 #   ROCPROF_SUMMARY_DISPATCH=8 ./rocprof_use_my_conv.sh   # force dispatch id for summary
 #   ROCPROF_RM_ANALYZE_TABLES=1 ./rocprof_use_my_conv.sh   # delete analyze_tables/ after merge (default: keep)
-#   WARMUP_ITERS=5 WORKLOAD_NAME=my_run ./rocprof_use_my_conv.sh
+#   WARMUP_ITERS=5 WORKLOAD_NAME=conv3_use_my_conv ./rocprof_use_my_conv.sh   # fixed name
 #   PYTHON=/path/to/conda/env/bin/python ./rocprof_use_my_conv.sh
 #
 # Requires: rocprof-compute on PATH (or set ROCPROF_COMPUTE), rocprofv3 (used
@@ -41,6 +52,19 @@ cd "$SCRIPT_DIR"
 
 if [[ -n "${CONDA_PREFIX:-}" && -d "${CONDA_PREFIX}/lib" ]]; then
   export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
+# rocprofv3 ATT: librocprof-trace-decoder.so (not always in /opt/rocm/lib). Auto-pick if ROCPROF_UI_ATT_LIBRARY_PATH unset:
+#   1) /opt/rocm/lib   2) sibling ../rocprof-trace-decoder/releases/linux_glibc_2_28_x86_64 (common checkout layout)
+if [[ -z "${ROCPROF_UI_ATT_LIBRARY_PATH:-}" ]]; then
+  if [[ -f /opt/rocm/lib/librocprof-trace-decoder.so ]]; then
+    ROCPROF_UI_ATT_LIBRARY_PATH="/opt/rocm/lib"
+  else
+    _att_default="$(cd "${SCRIPT_DIR}/.." && pwd)/rocprof-trace-decoder/releases/linux_glibc_2_28_x86_64"
+    if [[ -f "${_att_default}/librocprof-trace-decoder.so" ]]; then
+      ROCPROF_UI_ATT_LIBRARY_PATH="${_att_default}"
+    fi
+  fi
 fi
 
 PYTHON="${PYTHON:-python}"
@@ -67,10 +91,15 @@ if [[ -z "${ROCM_REQ}" ]]; then
 fi
 
 ROC_OUT_DIR="${ROC_OUT_DIR:-${SCRIPT_DIR}/rocprof_out}"
-WORKLOAD_NAME="${WORKLOAD_NAME:-conv3_use_my_conv}"
+# Timestamp avoids clobbering a fixed dirname (NO_CLEAN_ROCPROF_OUT still controls full-tree rm).
+WORKLOAD_NAME="${WORKLOAD_NAME:-$(date +%Y%m%d_%H%M%S)}"
 WARMUP_ITERS="${WARMUP_ITERS:-3}"
 WORKLOAD_PATH="${ROC_OUT_DIR}/${WORKLOAD_NAME}"
 export WORKLOAD_PATH
+# Set early + export so `set -u` is safe; any rocprof-compute continuation subshell still sees paths.
+PMC_DISPATCH_INFO="${WORKLOAD_PATH}/pmc_dispatch_info.csv"
+PMC_PERF="${WORKLOAD_PATH}/pmc_perf.csv"
+export PMC_DISPATCH_INFO PMC_PERF
 
 ROCPROF_COMPUTE="${ROCPROF_COMPUTE:-}"
 if [[ -z "${ROCPROF_COMPUTE}" ]]; then
@@ -89,10 +118,6 @@ if ! command -v rocprofv3 &>/dev/null; then
   exit 1
 fi
 
-# Fresh run: remove default output tree only.
-if [[ -z "${NO_CLEAN_ROCPROF_OUT:-}" && "${ROC_OUT_DIR}" == "${SCRIPT_DIR}/rocprof_out" ]]; then
-  rm -rf "${ROC_OUT_DIR}"
-fi
 mkdir -p "${ROC_OUT_DIR}"
 
 # rocprof-compute verifies importlib.metadata for names in requirements.txt;
@@ -146,12 +171,52 @@ echo "  warmups:  --warmup-iters ${WARMUP_ITERS} (per replay process)"
 echo "done. Results under: ${WORKLOAD_PATH}"
 echo "  e.g. rocprof-compute analyze -p ${WORKLOAD_PATH}"
 
+# rocprofv3 Advanced Thread Trace → ui_output_agent_*_dispatch_* (ROCprof Compute Viewer).
+# https://github.com/ROCm/rocprof-compute-viewer — Import → Rocprofv3 UI (pick dir that contains ui_output_*).
+if [[ -z "${ROCPROF_NO_UI_TRACE:-}" ]]; then
+  RCV_UI_PARENT="${ROCPROF_UI_TRACE_DIR:-${WORKLOAD_PATH}/ui_thread_trace}"
+  mkdir -p "${RCV_UI_PARENT}"
+  echo "rocprofv3 Advanced Thread Trace (ROCprof Compute Viewer) -> ${RCV_UI_PARENT}"
+  _rv3=(rocprofv3 --advanced-thread-trace 1 --kernel-trace 1 -d "${RCV_UI_PARENT}")
+  if [[ -n "${ROCPROF_UI_ATT_LIBRARY_PATH:-}" ]]; then
+    # One or more dirs to search for librocprof-trace-decoder.so (see ROCprof Trace Decoder releases).
+    read -r -a _att_lib_dirs <<<"${ROCPROF_UI_ATT_LIBRARY_PATH//:/ }"
+    _rv3+=(--att-library-path "${_att_lib_dirs[@]}")
+  fi
+  if [[ -n "${ROCPROF_UI_ATT_TARGET_CU:-}" ]]; then
+    _rv3+=(--att-target-cu "${ROCPROF_UI_ATT_TARGET_CU}")
+  fi
+  if [[ -n "${ROCPROF_UI_ATT_GPU_INDEX:-}" ]]; then
+    _rv3+=(--att-gpu-index "${ROCPROF_UI_ATT_GPU_INDEX}")
+  fi
+  if [[ -n "${ROCPROF_UI_ATT_SERIALIZE_ALL:-}" ]]; then
+    _rv3+=(--att-serialize-all 1)
+  fi
+  _rv3_ok=0
+  if "${_rv3[@]}" -- bash "${SCRIPT_DIR}/rocprof_conv3amd_app.sh" --use-my-conv --warmup-iters "${WARMUP_ITERS}"; then
+    _rv3_ok=1
+  else
+    echo "warning: rocprofv3 thread trace failed; continuing (PMC + summary unchanged)" >&2
+    echo "  Common cause: missing librocprof-trace-decoder.so — install ROCprof Trace Decoder (RCV README) or set ROCPROF_UI_ATT_LIBRARY_PATH." >&2
+  fi
+  _ui_dirs="$(find "${RCV_UI_PARENT}" -type d -name 'ui_output_agent_*' 2>/dev/null | head -5 || true)"
+  if [[ -n "${_ui_dirs}" ]]; then
+    echo "  RCV: Import → Rocprofv3 UI → pick a folder below (or its parent if RCV wants the dispatch parent):"
+    while IFS= read -r _d; do [[ -n "${_d}" ]] && echo "    ${_d}"; done <<<"${_ui_dirs}"
+  else
+    echo "warning: no ui_output_agent_* under ${RCV_UI_PARENT} (dir empty or only nested files)." >&2
+    echo "  Look for stderr: rocprof-trace-decoder library path not found" >&2
+    echo "  Or list: find ${RCV_UI_PARENT} -type f | head" >&2
+    if [[ "${_rv3_ok}" -eq 1 ]]; then
+      echo "  ATT exited 0 but no UI tree: try ROCPROF_UI_ATT_TARGET_CU=0 ROCPROF_UI_ATT_SERIALIZE_ALL=1 or another GPU index (ROCPROF_UI_ATT_GPU_INDEX)." >&2
+    fi
+  fi
+fi
+
 if [[ -n "${ROCPROF_NO_SUMMARY:-}" ]]; then
   exit 0
 fi
 
-PMC_DISPATCH_INFO="${WORKLOAD_PATH}/pmc_dispatch_info.csv"
-PMC_PERF="${WORKLOAD_PATH}/pmc_perf.csv"
 MERGE_PY="${SCRIPT_DIR}/rocprof_merge_percentage_summary.py"
 if [[ ! -f "${MERGE_PY}" ]]; then
   echo "warning: missing ${MERGE_PY}; skipping summary_percentages.csv" >&2

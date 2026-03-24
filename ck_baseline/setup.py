@@ -39,7 +39,7 @@ def _include_dirs() -> list[str]:
 
 
 sources = ["conv3d_my.cpp", "conv3d_my_kernel.cu"]
-extra_cxx = ["-O3", "-std=c++17"]
+extra_cxx = ["-O3", "-g", "-std=c++17"]
 # PyTorch ROCm adds -D__HIP_NO_HALF_* which breaks rocWMMA (static_cast<__half>(0.0f) in headers).
 _hip_rocwmma_fix = (
     ["-U__HIP_NO_HALF_CONVERSIONS__", "-U__HIP_NO_HALF_OPERATORS__"]
@@ -48,9 +48,9 @@ _hip_rocwmma_fix = (
 )
 extra_compile_args: dict[str, list[str]] = {
     "cxx": extra_cxx + _hip_rocwmma_fix,
+    # -g for hipcc/nvcc so profilers (e.g. ATT / RCV) get line-level source mapping.
+    "nvcc": ["-O3", "-g", "-std=c++17"] + _hip_rocwmma_fix,
 }
-if _hip_rocwmma_fix:
-    extra_compile_args["nvcc"] = list(_hip_rocwmma_fix)
 
 include_dirs = _include_dirs()
 # Optional: path to rocwmma headers (directory containing rocwmma/rocwmma.hpp), e.g.

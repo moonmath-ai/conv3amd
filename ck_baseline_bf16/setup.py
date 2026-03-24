@@ -60,7 +60,7 @@ def _include_dirs() -> list[str]:
 
 
 sources = ["conv3d_ck_bind.cpp", "conv3d_ck_launch.cu"]
-extra_cxx = ["-O3", "-std=c++17"]
+extra_cxx = ["-O3", "-g", "-std=c++17"]
 _hip_fix = (
     ["-U__HIP_NO_HALF_CONVERSIONS__", "-U__HIP_NO_HALF_OPERATORS__"]
     if getattr(torch.version, "hip", None) is not None
@@ -74,7 +74,7 @@ ck_defs = [
 ]
 extra_compile_args: dict[str, list[str]] = {
     "cxx": extra_cxx + _hip_fix + ck_defs,
-    "nvcc": ["-O3", "-std=c++17"] + _hip_fix + ck_defs,
+    "nvcc": ["-O3", "-g", "-std=c++17"] + _hip_fix + ck_defs,
 }
 
 setup(
