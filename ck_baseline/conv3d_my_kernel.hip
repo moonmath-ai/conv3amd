@@ -81,26 +81,40 @@ __global__ void conv3d_my_global_lds_kernel(
     // // __syncthreads();
 
     // load tubelet from global
+    // strip h-1
+    if (h_idx > 0) {
+      #pragma unroll
+      for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
+        const int base = t_idx * 3 * kPatchW + tx;
+        const int offset = (((b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + (h_idx - 1)) * kPatchW + tx;
+        tubelet[base] = input[offset];
+      }
+    } else {
+      #pragma unroll
+      for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
+        const int base = t_idx * 3 * kPatchW + tx;
+        tubelet[base] = 0;
+      }
+    }
+    // strip h
     #pragma unroll
     for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
       const int base = t_idx * 3 * kPatchW + tx;
-      // strip h-1
-      if (h_idx > 0) {
-        const int offset = (((b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + (h_idx - 1)) * kPatchW + tx;
-        tubelet[base] = input[offset];
-      } else {
-        tubelet[base] = 0;
-      }
-      // strip h
-      {
-        const int offset = (((b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + h_idx) * kPatchW + tx;
-        tubelet[base + kPatchW] = input[offset];
-      }
-      // strip h+1
-      if (h_idx + 1 < kPatchH) {
+      const int offset = (((b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + h_idx) * kPatchW + tx;
+      tubelet[base + kPatchW] = input[offset];
+    }
+    // strip h+1
+    if (h_idx + 1 < kPatchH) {
+      #pragma unroll
+      for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
+        const int base = t_idx * 3 * kPatchW + tx;
         const int offset = (((b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + (h_idx + 1)) * kPatchW + tx;
         tubelet[base + 2 * kPatchW] = input[offset];
-      } else {
+      }
+    } else {
+      #pragma unroll
+      for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
+        const int base = t_idx * 3 * kPatchW + tx;
         tubelet[base + 2 * kPatchW] = 0;
       }
     }
@@ -147,7 +161,17 @@ __global__ void conv3d_my_global_lds_kernel(
       const int offset = t_idx * 3 * kPatchW + tx;
       accumulators[cout_idx][base] += (tubelet[offset] + tubelet[offset + kPatchW] + tubelet[offset + 2 * kPatchW]);
     }
-  }
+
+    // if (cin_idx < kNumC - kChannelsPerOutGroup) {
+    //   continue;
+    // }
+    // // store accumulators to global
+    // #pragma unroll
+    // for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
+    //   const int base = (((b_idx * kNumC + outgrp_idx * kChannelsPerOutGroup + cout_idx) * kPatchT + t_idx) * kPatchH + h_idx) * kPatchW + tx;
+    //   const int offset = t_idx * kPatchW + tx;
+    //   output[base] = accumulators[cout_idx][offset];
+  } // cin_idx
 
   // loop over 16 output channels
   #pragma unroll
@@ -159,7 +183,7 @@ __global__ void conv3d_my_global_lds_kernel(
       const int offset = t_idx * kPatchW + tx;
       output[base] = accumulators[cout_idx][offset];
     }
-  }
+  } // cout_idx
 
 } // conv3d_my_global_lds_kernel
 } // namespace

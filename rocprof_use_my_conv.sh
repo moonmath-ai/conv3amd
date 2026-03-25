@@ -33,6 +33,9 @@
 #   WARMUP_ITERS=5 WORKLOAD_NAME=conv3_use_my_conv ./rocprof_use_my_conv.sh   # fixed name
 #   PYTHON=/path/to/conda/env/bin/python ./rocprof_use_my_conv.sh
 #
+# After ATT + (unless ROCPROF_NO_SUMMARY) analyze/summary: builds stats_*_isa.html from
+#   ui_thread_trace/stats_ui_output_agent_*_dispatch_*.csv via rocprof_att_stats_to_isa_html.py.
+#
 # Requires: rocprof-compute on PATH (or set ROCPROF_COMPUTE), rocprofv3 (used
 # internally), PyTorch HIP. rocprof-compute deps MUST be importable by the SAME
 # interpreter as PyTorch — use python -m pip (not bare pip), e.g.
@@ -100,6 +103,23 @@ export WORKLOAD_PATH
 PMC_DISPATCH_INFO="${WORKLOAD_PATH}/pmc_dispatch_info.csv"
 PMC_PERF="${WORKLOAD_PATH}/pmc_perf.csv"
 export PMC_DISPATCH_INFO PMC_PERF
+
+FORMAT_ISA_PY="${SCRIPT_DIR}/rocprof_att_stats_to_isa_html.py"
+generate_isa_html_tables() {
+  local _utt="${ROCPROF_UI_TRACE_DIR:-${WORKLOAD_PATH}/ui_thread_trace}"
+  [[ -f "${FORMAT_ISA_PY}" ]] || {
+    echo "warning: missing ${FORMAT_ISA_PY}; skip stats_*_isa.html" >&2
+    return 0
+  }
+  [[ -d "${_utt}" ]] || return 0
+  local -a _files
+  shopt -s nullglob
+  _files=( "${_utt}"/stats_ui_output_agent_*_dispatch_*.csv )
+  shopt -u nullglob
+  ((${#_files[@]})) || return 0
+  echo "ISA HTML (${#_files[@]} stats CSVs) -> ${FORMAT_ISA_PY##*/}"
+  "${PYTHON}" "${FORMAT_ISA_PY}" "${_files[@]}" || echo "warning: rocprof_att_stats_to_isa_html.py failed" >&2
+}
 
 ROCPROF_COMPUTE="${ROCPROF_COMPUTE:-}"
 if [[ -z "${ROCPROF_COMPUTE}" ]]; then
@@ -214,16 +234,19 @@ if [[ -z "${ROCPROF_NO_UI_TRACE:-}" ]]; then
 fi
 
 if [[ -n "${ROCPROF_NO_SUMMARY:-}" ]]; then
+  generate_isa_html_tables
   exit 0
 fi
 
 MERGE_PY="${SCRIPT_DIR}/rocprof_merge_percentage_summary.py"
 if [[ ! -f "${MERGE_PY}" ]]; then
   echo "warning: missing ${MERGE_PY}; skipping summary_percentages.csv" >&2
+  generate_isa_html_tables
   exit 0
 fi
 if [[ ! -f "${PMC_DISPATCH_INFO}" && ! -f "${PMC_PERF}" ]]; then
   echo "warning: no pmc_dispatch_info.csv or pmc_perf.csv under ${WORKLOAD_PATH}; skipping summary_percentages.csv" >&2
+  generate_isa_html_tables
   exit 0
 fi
 
@@ -290,6 +313,7 @@ fi
 
 if [[ -z "${DISPATCH_ID}" ]]; then
   echo "warning: could not determine dispatch id (conv3d_my or last dispatch); skipping summary" >&2
+  generate_isa_html_tables
   exit 0
 fi
 
@@ -309,6 +333,7 @@ if ! (
 )
 then
   echo "warning: rocprof-compute analyze failed; summary_percentages.csv not generated" >&2
+  generate_isa_html_tables
   exit 0
 fi
 
@@ -321,3 +346,5 @@ if [[ -n "${ROCPROF_RM_ANALYZE_TABLES:-}" ]]; then
   rm -rf "${ANALYZE_TABLES_DIR}"
   echo "  (removed analyze_tables/ — unset ROCPROF_RM_ANALYZE_TABLES to keep next time)"
 fi
+
+generate_isa_html_tables
