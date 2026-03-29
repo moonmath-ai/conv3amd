@@ -12,6 +12,7 @@
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT/ck_baseline" || { echo "Missing ck_baseline dir"; exit 1; }
+rm -rf build
 export PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH:-gfx942}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
 
