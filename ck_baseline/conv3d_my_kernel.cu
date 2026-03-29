@@ -30,20 +30,25 @@ __global__ void conv3d_my_global_lds_kernel(
   const char* __restrict__ weight,
   char* __restrict__ output) {
 
-  __shared__ char tubelet[kPatchT * 3 * kPatchW];
-  __shared__ char samples[kMFMAInputDim][kMFMAInternalDim];  // [16][32] for MFMA B(32x16)
-  __shared__ char filters[kChannelsPerOutGroup][kFilterPadded]; // [16][32] for MFMA A(16x32)
+  // __shared__ char samples[kMFMAInputDim][kMFMAInternalDim];  // [16][32] for MFMA B(32x16)
+  // __shared__ char filters[kChannelsPerOutGroup][kFilterPadded]; // [16][32] for MFMA A(16x32)
+  __shared__ char tubelet[2][kPatchT * 3 * kPatchW]; // tubelet double buffer
   __shared__ char accumulators[kChannelsPerOutGroup][kPatchT * kPatchW];
-
-  const int b_idx = blockIdx.z;
-  const int h_idx = blockIdx.x;
-  const int outgrp_idx = blockIdx.y;
-
-  const int tx = threadIdx.x;
-  const int wave_idx = tx / 64;
-  const int wave_tx = tx % 64;
-  const int wgrp = tx / 320;
-  const int wgrp_tx = tx % 320;
+  __shared__ int buf_semaphore[2]; // buffer semaphore
+  if (threadIdx.x == 0) {
+    buf_semaphore[0] = 0; // buffer 0 is empty
+    buf_semaphore[1] = 0; // buffer 1 is empty
+  }
+  __syncthreads(); // wait for all threads to initialize the semaphore
+  
+  const int b_idx = blockIdx.z; // batch index
+  const int h_idx = blockIdx.x; // height index
+  const int outgrp_idx = blockIdx.y; // output group index
+  const int tx = threadIdx.x; // thread index
+  const int wave_idx = tx / 64; // wave index
+  const int wave_tx = tx % 64; // wave thread index
+  const int wgrp = tx / 320; // wave group index
+  const int wgrp_tx = tx % 320; // wave group thread index
 
   // // zero pad group filters tail bytes once
   // for (int pid = tx; pid < kChannelsPerOutGroup * (kFilterPadded - kFilter); pid += kBlockSize) {
@@ -51,137 +56,117 @@ __global__ void conv3d_my_global_lds_kernel(
   //   const int col = kFilter + (pid % (kFilterPadded - kFilter));
   //   filters[c_idx][col] = 0;
   // }
-  // // __syncthreads();
 
-  // loop over all 128 input channels
-  for (int cin_idx = 0; cin_idx < kNumC; ++cin_idx) {
+  if (wave_idx == 0) { // producer
 
-    // // load group filters from global
-    // // TODO: better coalescing if order is (cin, cout) instead of (cout, cin)
-    // #pragma unroll
-    // for (int c_idx = 0; c_idx < kFiltersLoadedInFirstTxWave; ++c_idx) {
-    //   const int cout_idx = outgrp_idx * kChannelsPerOutGroup + c_idx;
-    //   const int filter_off = c_idx * kFilter;
-    //   if ((tx >= filter_off) && (tx < filter_off + kFilter)) {
-    //     const int offset = (cout_idx * kNumC + cin_idx) * kFilter + (tx - filter_off);
-    //     filters[c_idx][tx - filter_off] = weight[offset];
-    //   }
-    // }
-    // #pragma unroll
-    // for (int c_idx = kFiltersLoadedInFirstTxWave; c_idx < kChannelsPerOutGroup; ++c_idx) {
-    //   const int cout_idx = outgrp_idx * kChannelsPerOutGroup + c_idx;
-    //   const int filter_off = (c_idx - kFiltersLoadedInFirstTxWave) * kFilter;
-    //   if ((tx >= filter_off) && (tx < filter_off + kFilter)) {
-    //     const int offset = (cout_idx * kNumC + cin_idx) * kFilter + (tx - filter_off);
-    //     filters[c_idx][tx - filter_off] = weight[offset];
-    //   }
-    // }
-    // // __syncthreads();
+    // loop over all 128 input channels
+    for (int cin_idx = 0; cin_idx < kNumC; ++cin_idx) {
+      const int buf = cin_idx % 2;
+      // load tubelet from global
 
-    // load tubelet from global
-    // strip h-1
-    if (h_idx > 0) {
+      // acquire buffer semaphore
+      if (wave_tx == 0) {
+        while (__atomic_load_n(&buf_semaphore[buf], __ATOMIC_ACQUIRE) > 0) { __builtin_amdgcn_s_sleep(1); }
+      }
+      __builtin_amdgcn_wave_barrier();
+
+      // low edge
+      if (h_idx == 0) {
+        #pragma unroll
+        for (int w_idx = 0; w_idx < 5; ++w_idx) {
+          #pragma unroll
+          for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
+            const int base = t_idx * 3 * kPatchW + w_idx * 64 + tx;
+            const int offset = (((b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + h_idx) * kPatchW + w_idx * 64 + tx;
+            tubelet[buf][base] = 0;
+            tubelet[buf][base + kPatchW] = input[offset];
+            tubelet[buf][base + 2 * kPatchW] = input[offset + kPatchW];
+          }
+        }
+      } 
+      // high edge
+      else if (h_idx == kPatchH - 1) {
+        #pragma unroll
+        for (int w_idx = 0; w_idx < 5; ++w_idx) {
+          #pragma unroll
+          for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
+            const int base = t_idx * 3 * kPatchW + w_idx * 64 + tx;
+            const int offset = (((b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + h_idx) * kPatchW + w_idx * 64 + tx;
+            tubelet[buf][base] = input[offset - kPatchW];
+            tubelet[buf][base + kPatchW] = input[offset];
+            tubelet[buf][base + 2 * kPatchW] = 0;
+          }
+        }  
+      } 
+      // middle
+      else {
+        #pragma unroll
+        for (int w_idx = 0; w_idx < 5; ++w_idx) {
+          #pragma unroll
+          for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
+            const int base = t_idx * 3 * kPatchW + w_idx * 64 + tx;
+            const int offset = (((b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + h_idx) * kPatchW + w_idx * 64 + tx;
+            tubelet[buf][base] = input[offset - kPatchW];
+            tubelet[buf][base + kPatchW] = input[offset];
+            tubelet[buf][base + 2 * kPatchW] = input[offset + kPatchW];
+          }
+        }  
+      }
+
+      // release buffer semaphore
+      if (wave_tx == 0) {
+        __atomic_store_n(&buf_semaphore[buf], 4, __ATOMIC_RELEASE);
+      }
+    } // cin_idx
+
+  } // producer
+  else 
+  { // consumer x4
+
+    // loop over all 128 input channels
+    for (int cin_idx = 0; cin_idx < kNumC; ++cin_idx) {
+      const int buf = cin_idx % 2;
+
+      // acquire buffer semaphore
+      if (wave_tx == 0) {
+        while (__atomic_load_n(&buf_semaphore[buf], __ATOMIC_ACQUIRE) == 0) { __builtin_amdgcn_s_sleep(1); }
+      }
+      __builtin_amdgcn_wave_barrier();
+
+      // temporary accumulators assignment (sum all)
+      const int cout_idx = cin_idx % kChannelsPerOutGroup;
       #pragma unroll
       for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-        const int base = t_idx * 3 * kPatchW + tx;
-        const int offset = (((b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + (h_idx - 1)) * kPatchW + tx;
-        tubelet[base] = input[offset];
+        const int base = t_idx * kPatchW + tx;
+        const int offset = t_idx * 3 * kPatchW + tx;
+        accumulators[cout_idx][base] += (tubelet[buf][offset] + tubelet[buf][offset + kPatchW] + tubelet[buf][offset + 2 * kPatchW]);
       }
-    } else {
-      #pragma unroll
-      for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-        const int base = t_idx * 3 * kPatchW + tx;
-        tubelet[base] = 0;
+      const int base = (wave_idx - 1) * kPatchW + wave_tx;
+      const int offset = (wave_idx - 1) * 3 * kPatchW + wave_tx;
+      accumulators[cout_idx][base] += (tubelet[buf][offset] + tubelet[buf][offset + kPatchW] + tubelet[buf][offset + 2 * kPatchW]);
+
+      // release buffer semaphore
+      if (wave_tx == 0) {
+        __atomic_fetch_add(&buf_semaphore[buf], -1, __ATOMIC_RELEASE);
       }
-    }
-    // strip h
+    } // cin_idx
+
+    // loop over 16 output channels
     #pragma unroll
-    for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-      const int base = t_idx * 3 * kPatchW + tx;
-      const int offset = (((b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + h_idx) * kPatchW + tx;
-      tubelet[base + kPatchW] = input[offset];
-    }
-    // strip h+1
-    if (h_idx + 1 < kPatchH) {
+    for (int cout_idx = 0; cout_idx < kChannelsPerOutGroup; ++cout_idx) {
+      // store accumulators to global
       #pragma unroll
       for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-        const int base = t_idx * 3 * kPatchW + tx;
-        const int offset = (((b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + (h_idx + 1)) * kPatchW + tx;
-        tubelet[base + 2 * kPatchW] = input[offset];
+        const int base = (((b_idx * kNumC + outgrp_idx * kChannelsPerOutGroup + cout_idx) * kPatchT + t_idx) * kPatchH + h_idx) * kPatchW + tx;
+        const int offset = t_idx * kPatchW + tx;
+        output[base] = accumulators[cout_idx][offset];
       }
-    } else {
-      #pragma unroll
-      for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-        const int base = t_idx * 3 * kPatchW + tx;
-        tubelet[base + 2 * kPatchW] = 0;
-      }
-    }
-
-    // // convolution
-    // // load filters to A matrix (16x32)
-    // // A: row-major; A(16,32) <- filters[:16][:32]
-    // rocwmma::fragment<rocwmma::matrix_a, kMFMAInputDim, kMFMAOutputDim, kMFMAInternalDim, rocwmma::float8_fnuz_t, rocwmma::row_major> frag_a;
-    // rocwmma::load_matrix_sync(frag_a, reinterpret_cast<const rocwmma::float8_fnuz_t*>(&filters[0][0]), static_cast<uint32_t>(kFilterPadded));
-
-    // // process tubelet across all output group channels
-    // for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-    //   for (int w_idx = 0; w_idx < kPatchWPerMFMAExe; ++w_idx) {
-    //     // load accumulators chunk to C matrix (16x16) - zero on first input channel
-    //     // C: row-major; C(16,16) <- accumulators[:16][t*kPatchW+w*kMFMAInputDim:+16]
-    //     rocwmma::fragment<rocwmma::accumulator, kMFMAInputDim, kMFMAOutputDim, kMFMAInternalDim, rocwmma::float8_fnuz_t, rocwmma::row_major> frag_c;
-    //     if (cin_idx == 0) {
-    //       rocwmma::fill_fragment(frag_c, rocwmma::float8_fnuz_t{});
-    //     } else {
-    //       rocwmma::load_matrix_sync(frag_c, reinterpret_cast<const rocwmma::float8_fnuz_t*>(&accumulators[0][t_idx * kPatchW + w_idx * kMFMAInputDim]), static_cast<uint32_t>(kPatchT * kPatchW));
-    //     }
-
-    //     // load tubelet chunk to B matrix (32x16)
-    //     // initially move to samples
-    //     // for (int s_idx = 0; s_idx < kMFMAInputDim; ++s_idx) {
-    //     //   samples[s_idx][w_idx * kMFMAInputDim + tx] = tubelet[t_idx * 3 * kPatchW + kPatchW + tx];
-    //     // }
-    //     rocwmma::fragment<rocwmma::matrix_b, kMFMAInputDim, kMFMAOutputDim, kMFMAInternalDim, rocwmma::float8_fnuz_t, rocwmma::col_major> frag_b;
-    //     rocwmma::load_matrix_sync(frag_b, reinterpret_cast<const rocwmma::float8_fnuz_t*>(&samples[0][0]), static_cast<uint32_t>(kMFMAInternalDim), rocwmma::layout_t::mem_row_major);
-
-    //     // MFMA A(16x32) x B(32x16) + C(16x16) -> D(16x16)
-    //     rocwmma::mma_sync(frag_c, frag_a, frag_b, frag_c);
-
-    //     // store accumulators chunk from D matrix (16x16) including fp32->fp8 conversion
-    //     rocwmma::store_matrix_sync(reinterpret_cast<rocwmma::float8_fnuz_t*>(&accumulators[0][t_idx * kPatchW + w_idx * kMFMAInputDim]), frag_c, static_cast<uint32_t>(kPatchT * kPatchW));
-    //   }
-    // }
-
-    // temporary accumulators assignment (sum all)
-    const int cout_idx = cin_idx % kChannelsPerOutGroup;
-    #pragma unroll
-    for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-      const int base = t_idx * kPatchW + tx;
-      const int offset = t_idx * 3 * kPatchW + tx;
-      accumulators[cout_idx][base] += (tubelet[offset] + tubelet[offset + kPatchW] + tubelet[offset + 2 * kPatchW]);
-    }
-
-    // if (cin_idx < kNumC - kChannelsPerOutGroup) {
-    //   continue;
-    // }
-    // // store accumulators to global
-    // #pragma unroll
-    // for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-    //   const int base = (((b_idx * kNumC + outgrp_idx * kChannelsPerOutGroup + cout_idx) * kPatchT + t_idx) * kPatchH + h_idx) * kPatchW + tx;
-    //   const int offset = t_idx * kPatchW + tx;
-    //   output[base] = accumulators[cout_idx][offset];
-  } // cin_idx
-
-  // loop over 16 output channels
-  #pragma unroll
-  for (int cout_idx = 0; cout_idx < kChannelsPerOutGroup; ++cout_idx) {
-    // store accumulators to global
-    #pragma unroll
-    for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-      const int base = (((b_idx * kNumC + outgrp_idx * kChannelsPerOutGroup + cout_idx) * kPatchT + t_idx) * kPatchH + h_idx) * kPatchW + tx;
-      const int offset = t_idx * kPatchW + tx;
+      const int base = (((b_idx * kNumC + outgrp_idx * kChannelsPerOutGroup + cout_idx) * kPatchT + wave_idx - 1) * kPatchH + h_idx) * kPatchW + wave_tx;
+      const int offset = (wave_idx - 1) * kPatchW + wave_tx;
       output[base] = accumulators[cout_idx][offset];
-    }
-  } // cout_idx
+    } // cout_idx
+
+  } // consumer
 
 } // conv3d_my_global_lds_kernel
 } // namespace
