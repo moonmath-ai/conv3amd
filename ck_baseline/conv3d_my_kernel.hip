@@ -18,19 +18,17 @@ constexpr int kNumC = 128;
 constexpr int kPatchT = 4;
 constexpr int kPatchH = 192;
 constexpr int kPatchW = 320;
+constexpr int kPatchWDiv4 = kPatchW / 4; // 80
+constexpr int kPatchWDiv16 = kPatchW / 16; // 20
 constexpr int kKernel = 3;
 constexpr int kFilter = 27; // kKernel * kKernel * kKernel = 27
 
-constexpr int kBlockSize = kPatchW + 64;
+constexpr int kBlockSize = kPatchW;
 constexpr int kChannelsPerOutGroup = kMFMAOutputDim; // 16
-constexpr int kFilterPadded = kMFMAInternalDim; // 32
-constexpr int kPatchWPerMFMAExe = kPatchW / kMFMAInputDim; // 20
-constexpr int kFiltersLoadedInFirstTxWave = 11; // 11 * kFilter = 297 <= kBlockSize
 
-constexpr int kChunkSize = 16;
-static_assert(kPatchW % kChunkSize == 0);
-constexpr int kChunksPerPatchW = kPatchW / kChunkSize; // 20
-constexpr int kNumProducerThreads = kChunksPerPatchW * kKernel; // 60
+// constexpr int kFilterPadded = kMFMAInternalDim; // 32
+// constexpr int kPatchWPerMFMAExe = kPatchW / kMFMAInputDim; // 20
+// constexpr int kFiltersLoadedInFirstTxWave = 11; // 11 * kFilter = 297 <= kBlockSize
 
 namespace {
 
@@ -85,140 +83,104 @@ __global__ void conv3d_my_global_lds_kernel(
   //   filters[c_idx][col] = 0;
   // }
 
-  __shared__ char tubelet[2][kPatchT * kKernel * kPatchW] __attribute__((aligned(kChunkSize))); // tubelet double buffer
-  __shared__ char accumulators[kChannelsPerOutGroup][kPatchT * kPatchW] __attribute__((aligned(kChunkSize))); // output accumulators
+  __shared__ char tubelet[2][kPatchT * kKernel * kPatchW] __attribute__((aligned(16))); // tubelet double buffer
+  __shared__ char accumulators[kChannelsPerOutGroup][kPatchT * kPatchW] __attribute__((aligned(16))); // output accumulators
   #pragma unroll
-  for (int i = tx; i < kChannelsPerOutGroup * kPatchT * kPatchW / 16; i += kBlockSize) {
+  for (int i = tx; i < kChannelsPerOutGroup * kPatchT * kPatchWDiv16; i += kBlockSize) {
     reinterpret_cast<int4*>(&accumulators[0][0])[i] = make_int4(0, 0, 0, 0);
   }
-  __shared__ int sema[2]; // semaphore for producer and consumer
-  if (tx == kBlockSize - 1) {
-    reinterpret_cast<int2*>(&sema[0])[0] = make_int2(5, 0);
-  }
   __syncthreads();
 
   //////////////////////////////////////////////////////////////
-  // producer prolog: initial load of tubelet[0] for cin_idx = 0
-  if (tx < kPatchT * kNumProducerThreads) {
-    const int w_chunk = tx % kChunksPerPatchW;
-    const int k_idx   = (tx / kChunksPerPatchW) % kKernel;
+  // prolog: produce first
+  int cin_idx = 0;
+  int buf = 0;
+  #pragma unroll
+  for (int i = tx; i < kPatchT * kKernel * kPatchWDiv4; i += kBlockSize) {
+    const int w_chunk = i % kPatchWDiv4;
+    const int k_idx   = (i / kPatchWDiv4) % kKernel;
     const int h_idx   = h_ctr_idx + k_idx - 1;
-    const int t_idx   = tx / kChunksPerPatchW / kKernel % kPatchT;
+    const int t_idx   = (i / kPatchWDiv4) / kKernel;
 
-    // lds base address
-    const int base = (t_idx * kKernel + k_idx) * kPatchW + w_chunk * kChunkSize;  
-    // global input offset
-    const size_t offset = ((static_cast<size_t>(b_idx * kNumC + 0) * kPatchT + t_idx) * kPatchH + static_cast<size_t>(h_idx)) * kPatchW + static_cast<size_t>(w_chunk * kChunkSize);
-
+    const int tptr = (t_idx * kKernel + k_idx) * kPatchW + w_chunk * 4;
     if (h_idx < 0 || h_idx >= kPatchH) {
-      // zero pad when h_idx is out of bounds
-      *reinterpret_cast<int4*>(&tubelet[0][base]) = make_int4(0, 0, 0, 0);
+      // zero pad when h_idx is oob
+      *reinterpret_cast<int*>(&tubelet[buf][tptr]) = 0;
     } else {
       // load from global to lds
-      // *reinterpret_cast<int4*>(&tubelet[0][base]) = *reinterpret_cast<const int4*>(&input[offset]);
-      async_global_to_lds_4b(&tubelet[0][base + 0],  input, offset + 0);
-      async_global_to_lds_4b(&tubelet[0][base + 4],  input, offset + 4);
-      async_global_to_lds_4b(&tubelet[0][base + 8],  input, offset + 8);
-      async_global_to_lds_4b(&tubelet[0][base + 12], input, offset + 12);
+      const size_t iptr = ((static_cast<size_t>(b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + static_cast<size_t>(h_idx)) * kPatchW + static_cast<size_t>(w_chunk * 4);
+      async_global_to_lds_4b(&tubelet[buf][tptr], input, iptr);
     }
-  } // producer prolog
-  asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)");
-  __syncthreads();
+  }
 
   //////////////////////////////////////////////////////////////
-  // main producer loop: 128 input channels
-  if (tx >= kPatchW) {
-    for (int cin_idx = 1; cin_idx < kNumC; ++cin_idx) {
-      const int buf = cin_idx % 2;
+  // main loop: produce next + consume current
+  while (cin_idx < kNumC - 1) {
+    const int curr_cin_idx = cin_idx;
+    const int curr_buf = buf;
 
-      // producer ongoing
-      const int w_chunk = wave_tx % kChunksPerPatchW;
-      const int k_idx   = (wave_tx / kChunksPerPatchW) % kKernel;
+    // sync next buf
+    asm volatile("s_barrier" ::: "memory");
+
+    // produce next buf
+    cin_idx++;
+    buf = (buf + 1) % 2;
+    #pragma unroll
+    for (int i = tx; i < kPatchT * kKernel * kPatchWDiv4; i += kBlockSize) {
+      const int w_chunk = i % kPatchWDiv4;
+      const int k_idx   = (i / kPatchWDiv4) % kKernel;
       const int h_idx   = h_ctr_idx + k_idx - 1;
-
-      if (wave_tx == 0) { while (__atomic_load_n(&sema[buf], __ATOMIC_RELAXED) > 0) { __builtin_amdgcn_s_sleep(8); } }
-      __builtin_amdgcn_wave_barrier();
-
-      if (wave_tx < kNumProducerThreads) {
-        // lds base address
-        const int base =  k_idx * kPatchW + w_chunk * kChunkSize;  
-        // global input offset
-        const size_t offset = ((static_cast<size_t>(b_idx * kNumC + cin_idx) * kPatchT) * kPatchH + static_cast<size_t>(h_idx)) * kPatchW + static_cast<size_t>(w_chunk * kChunkSize);
-
-        if (h_idx < 0 || h_idx >= kPatchH) {
-          // zero pad when h_idx is out of bounds
-          *reinterpret_cast<int4*>(&tubelet[buf][base]) = make_int4(0, 0, 0, 0);
-          *reinterpret_cast<int4*>(&tubelet[buf][base + kKernel * kPatchW]) = make_int4(0, 0, 0, 0);
-          *reinterpret_cast<int4*>(&tubelet[buf][base + 2 * kKernel * kPatchW]) = make_int4(0, 0, 0, 0);
-          *reinterpret_cast<int4*>(&tubelet[buf][base + 3 * kKernel * kPatchW]) = make_int4(0, 0, 0, 0);
-        } else {
-          // load from global to lds
-          // *reinterpret_cast<int4*>(&tubelet[buf][base]) = *reinterpret_cast<const int4*>(&input[offset]);
-          // *reinterpret_cast<int4*>(&tubelet[buf][base + kKernel * kPatchW]) = *reinterpret_cast<const int4*>(&input[offset + kPatchH * kPatchW]);
-          // *reinterpret_cast<int4*>(&tubelet[buf][base + 2 * kKernel * kPatchW]) = *reinterpret_cast<const int4*>(&input[offset + 2 * kPatchH * kPatchW]);
-          // *reinterpret_cast<int4*>(&tubelet[buf][base + 3 * kKernel * kPatchW]) = *reinterpret_cast<const int4*>(&input[offset + 3 * kPatchH * kPatchW]);
-          async_global_to_lds_4b(&tubelet[buf][base + 0],  input, offset + 0);
-          async_global_to_lds_4b(&tubelet[buf][base + 4],  input, offset + 4);
-          async_global_to_lds_4b(&tubelet[buf][base + 8],  input, offset + 8);
-          async_global_to_lds_4b(&tubelet[buf][base + 12], input, offset + 12);
-          async_global_to_lds_4b(&tubelet[buf][base + kKernel * kPatchW + 0],  input, offset + kPatchH * kPatchW + 0);
-          async_global_to_lds_4b(&tubelet[buf][base + kKernel * kPatchW + 4],  input, offset + kPatchH * kPatchW + 4);
-          async_global_to_lds_4b(&tubelet[buf][base + kKernel * kPatchW + 8],  input, offset + kPatchH * kPatchW + 8);
-          async_global_to_lds_4b(&tubelet[buf][base + kKernel * kPatchW + 12], input, offset + kPatchH * kPatchW + 12);
-          async_global_to_lds_4b(&tubelet[buf][base + 2 * kKernel * kPatchW + 0],  input, offset + 2 * kPatchH * kPatchW + 0);
-          async_global_to_lds_4b(&tubelet[buf][base + 2 * kKernel * kPatchW + 4],  input, offset + 2 * kPatchH * kPatchW + 4);
-          async_global_to_lds_4b(&tubelet[buf][base + 2 * kKernel * kPatchW + 8],  input, offset + 2 * kPatchH * kPatchW + 8);
-          async_global_to_lds_4b(&tubelet[buf][base + 2 * kKernel * kPatchW + 12], input, offset + 2 * kPatchH * kPatchW + 12);
-          async_global_to_lds_4b(&tubelet[buf][base + 3 * kKernel * kPatchW + 0],  input, offset + 3 * kPatchH * kPatchW + 0);
-          async_global_to_lds_4b(&tubelet[buf][base + 3 * kKernel * kPatchW + 4],  input, offset + 3 * kPatchH * kPatchW + 4);
-          async_global_to_lds_4b(&tubelet[buf][base + 3 * kKernel * kPatchW + 8],  input, offset + 3 * kPatchH * kPatchW + 8);
-          async_global_to_lds_4b(&tubelet[buf][base + 3 * kKernel * kPatchW + 12], input, offset + 3 * kPatchH * kPatchW + 12);         }
+      const int t_idx   = (i / kPatchWDiv4) / kKernel;
+  
+      const int tptr = (t_idx * kKernel + k_idx) * kPatchW + w_chunk * 4;
+      if (h_idx < 0 || h_idx >= kPatchH) {
+        // zero pad when h_idx is oob
+        *reinterpret_cast<int*>(&tubelet[buf][tptr]) = 0;
+      } else {
+        // load from global to lds
+        const size_t iptr = ((static_cast<size_t>(b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + static_cast<size_t>(h_idx)) * kPatchW + static_cast<size_t>(w_chunk * 4);
+        async_global_to_lds_4b(&tubelet[buf][tptr], input, iptr);
       }
+    }
 
-      asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)");
-      if (wave_tx == 0) { __atomic_store_n(&sema[buf], 5, __ATOMIC_RELEASE); }
-      __builtin_amdgcn_wave_barrier();
-    } // cin_idx loop
-  } // main producer loop
+    // sync current buf
+    asm volatile("s_waitcnt vmcnt(3) lgkmcnt(3)");
+    asm volatile("s_barrier" ::: "memory");
+  
+    // consume current buf
+    const int cout_idx = curr_cin_idx % kChannelsPerOutGroup;
+    #pragma unroll
+    for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
+      const int aptr = t_idx * kPatchW + tx;
+      const int tptr = t_idx * kKernel * kPatchW + tx;
+      accumulators[cout_idx][aptr] += (tubelet[curr_buf][tptr] + tubelet[curr_buf][tptr + kPatchW] + tubelet[curr_buf][tptr + 2 * kPatchW]);
+    }
+  } // cin_idx loop
 
   //////////////////////////////////////////////////////////////
-  // main consumer loop: 128 input channels
-  if (tx < kPatchW) {
-    for (int cin_idx = 0; cin_idx < kNumC; ++cin_idx) {
-      const int buf = cin_idx % 2;
-
-      if (wave_tx == 0) { while (__atomic_load_n(&sema[buf], __ATOMIC_ACQUIRE) == 0) { __builtin_amdgcn_s_sleep(1); } }
-      __builtin_amdgcn_wave_barrier();
-      asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)");
-
-      // temporary accumulators assignment (sum all)
-      const int cout_idx = cin_idx % kChannelsPerOutGroup;
-      #pragma unroll
-      for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-        const int base = t_idx * kPatchW + tx;
-        const int offset = t_idx * kKernel * kPatchW + tx;
-        accumulators[cout_idx][base] += (tubelet[buf][offset] + tubelet[buf][offset + kPatchW] + tubelet[buf][offset + 2 * kPatchW]);
-      }
-
-      if (wave_tx == 0) { __atomic_fetch_sub(&sema[buf], 1, __ATOMIC_RELAXED); }
-      __builtin_amdgcn_wave_barrier();
-    } // cin_idx loop
-  } // main consumer loop
+  // epilog: consume last
+  asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)");
+  asm volatile("s_barrier" ::: "memory");
+  const int cout_idx = cin_idx % kChannelsPerOutGroup;
+  #pragma unroll
+  for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
+    const int aptr = t_idx * kPatchW + tx;
+    const int tptr = t_idx * kKernel * kPatchW + tx;
+    accumulators[cout_idx][aptr] += (tubelet[buf][tptr] + tubelet[buf][tptr + kPatchW] + tubelet[buf][tptr + 2 * kPatchW]);
+  }
 
   //////////////////////////////////////////////////////////////
   // output loop: 16 output channels
-  if(tx < kPatchW) {
+  #pragma unroll
+  for (int cout_idx = 0; cout_idx < kChannelsPerOutGroup; ++cout_idx) {
+    // store accumulators to global
     #pragma unroll
-    for (int cout_idx = 0; cout_idx < kChannelsPerOutGroup; ++cout_idx) {
-      // store accumulators to global
-      #pragma unroll
-      for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-        const int base = (((b_idx * kNumC + outgrp_idx * kChannelsPerOutGroup + cout_idx) * kPatchT + t_idx) * kPatchH + h_ctr_idx) * kPatchW + tx;
-        const int offset = t_idx * kPatchW + tx;
-        output[base] = accumulators[cout_idx][offset];
-      }
-    } // cout_idx loop
-  } // output loop
+    for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
+      const int base = (((b_idx * kNumC + outgrp_idx * kChannelsPerOutGroup + cout_idx) * kPatchT + t_idx) * kPatchH + h_ctr_idx) * kPatchW + tx;
+      const int offset = t_idx * kPatchW + tx;
+      output[base] = accumulators[cout_idx][offset];
+    }
+  } // cout_idx loop
 
 } // conv3d_my_global_lds_kernel
 } // namespace
