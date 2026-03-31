@@ -2,7 +2,7 @@
 #include "hip/hip_runtime.h"
 /**
  * float8_e4m3fn stub: per-block LDS holds three H tubelets (h-1, h, h+1); zero-pad missing neighbors.
- * Loads input at h_idx-1 / h_idx / h_idx+1; output is still the center tubelet only (identity).
+ * Loads input at h_ctr_idx-1 / h_ctr_idx / h_ctr_idx+1; output is still the center tubelet only (identity).
  *
  * Grid: (x, y, z) = (H tubelet index, C_out/16 groups, batch). Threads map to W (coalesced).
  */
@@ -13,45 +13,71 @@
 constexpr int kMFMAInputDim = 16;
 constexpr int kMFMAOutputDim = 16;
 constexpr int kMFMAInternalDim = 32;
+
 constexpr int kNumC = 128;
+constexpr int kPatchT = 4;
 constexpr int kPatchH = 192;
 constexpr int kPatchW = 320;
-constexpr int kPatchT = 4;
 constexpr int kKernel = 3;
 constexpr int kFilter = 27; // kKernel * kKernel * kKernel = 27
 
-constexpr int kBlockSize = kPatchW;
+constexpr int kBlockSize = kPatchW + 64;
 constexpr int kChannelsPerOutGroup = kMFMAOutputDim; // 16
 constexpr int kFilterPadded = kMFMAInternalDim; // 32
 constexpr int kPatchWPerMFMAExe = kPatchW / kMFMAInputDim; // 20
 constexpr int kFiltersLoadedInFirstTxWave = 11; // 11 * kFilter = 297 <= kBlockSize
 
+constexpr int kChunkSize = 16;
+static_assert(kPatchW % kChunkSize == 0);
+constexpr int kChunksPerPatchW = kPatchW / kChunkSize; // 20
+constexpr int kNumProducerThreads = kChunksPerPatchW * kKernel; // 60
+
 namespace {
+
+typedef int v4i32 __attribute__((vector_size(16)));
+
+extern "C" __device__ void llvm_amdgcn_raw_buffer_load_lds(
+  v4i32 rsrc,
+  uint32_t __attribute__((address_space(3)))* lds,
+  uint32_t size,
+  uint32_t voff,
+  uint32_t soff,
+  uint32_t imm,
+  uint32_t aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
+
+__device__ inline void async_global_to_lds_4b(char* smem, const char* base, size_t global_offset) {
+  struct __attribute__((packed)) { 
+    const void* ptr; 
+    uint32_t range; 
+    uint32_t config; 
+  } br{base + global_offset, 0xffffffffu, 0x00020000u};
+  
+  llvm_amdgcn_raw_buffer_load_lds(
+    __builtin_bit_cast(v4i32, br),                                // RSRC Descriptor
+    (uint32_t __attribute__((address_space(3)))*)(uintptr_t)smem, // LDS Dest (Space 3)
+    4u, // Size: 4 bytes
+    0u, // voffset: 0 (since addr is in rsrc)
+    0u, // soffset: 0
+    0u, // imm offset: 0
+    0u  // aux: 0
+  );
+}
+
+
 __global__ void conv3d_my_global_lds_kernel(
   const char* __restrict__ input,
   const char* __restrict__ weight,
   char* __restrict__ output) {
 
-  // __shared__ char samples[kMFMAInputDim][kMFMAInternalDim];  // [16][32] for MFMA B(32x16)
-  // __shared__ char filters[kChannelsPerOutGroup][kFilterPadded]; // [16][32] for MFMA A(16x32)
-  __shared__ char tubelet[2][kPatchT * 3 * kPatchW]; // tubelet double buffer
-  __shared__ char accumulators[kChannelsPerOutGroup][kPatchT * kPatchW];
-  __shared__ int buf_semaphore[2]; // buffer semaphore
-  if (threadIdx.x == 0) {
-    buf_semaphore[0] = 0; // buffer 0 is empty
-    buf_semaphore[1] = 0; // buffer 1 is empty
-  }
-  __syncthreads(); // wait for all threads to initialize the semaphore
-  
   const int b_idx = blockIdx.z; // batch index
-  const int h_idx = blockIdx.x; // height index
+  const int h_ctr_idx = blockIdx.x; // height index
   const int outgrp_idx = blockIdx.y; // output group index
   const int tx = threadIdx.x; // thread index
   const int wave_idx = tx / 64; // wave index
   const int wave_tx = tx % 64; // wave thread index
-  const int wgrp = tx / 320; // wave group index
-  const int wgrp_tx = tx % 320; // wave group thread index
 
+  // __shared__ char samples[kMFMAInputDim][kMFMAInternalDim];  // [16][32] for MFMA B(32x16)
+  // __shared__ char filters[kChannelsPerOutGroup][kFilterPadded]; // [16][32] for MFMA A(16x32)
   // // zero pad group filters tail bytes once
   // for (int pid = tx; pid < kChannelsPerOutGroup * (kFilterPadded - kFilter); pid += kBlockSize) {
   //   const int c_idx = pid / (kFilterPadded - kFilter);
@@ -59,116 +85,140 @@ __global__ void conv3d_my_global_lds_kernel(
   //   filters[c_idx][col] = 0;
   // }
 
-  if (wave_idx == 0) { // producer
+  __shared__ char tubelet[2][kPatchT * kKernel * kPatchW] __attribute__((aligned(kChunkSize))); // tubelet double buffer
+  __shared__ char accumulators[kChannelsPerOutGroup][kPatchT * kPatchW] __attribute__((aligned(kChunkSize))); // output accumulators
+  #pragma unroll
+  for (int i = tx; i < kChannelsPerOutGroup * kPatchT * kPatchW / 16; i += kBlockSize) {
+    reinterpret_cast<int4*>(&accumulators[0][0])[i] = make_int4(0, 0, 0, 0);
+  }
+  __shared__ int sema[2]; // semaphore for producer and consumer
+  if (tx == kBlockSize - 1) {
+    reinterpret_cast<int2*>(&sema[0])[0] = make_int2(5, 0);
+  }
+  __syncthreads();
 
-    // loop over all 128 input channels
-    for (int cin_idx = 0; cin_idx < kNumC; ++cin_idx) {
-      const int buf = cin_idx % 2;
-      // load tubelet from global
+  //////////////////////////////////////////////////////////////
+  // producer prolog: initial load of tubelet[0] for cin_idx = 0
+  if (tx < kPatchT * kNumProducerThreads) {
+    const int w_chunk = tx % kChunksPerPatchW;
+    const int k_idx   = (tx / kChunksPerPatchW) % kKernel;
+    const int h_idx   = h_ctr_idx + k_idx - 1;
+    const int t_idx   = tx / kChunksPerPatchW / kKernel % kPatchT;
 
-      // acquire buffer semaphore
-      if (wave_tx == 0) {
-        while (__atomic_load_n(&buf_semaphore[buf], __ATOMIC_ACQUIRE) > 0) { __builtin_amdgcn_s_sleep(1); }
-      }
-      __builtin_amdgcn_wave_barrier();
+    // lds base address
+    const int base = (t_idx * kKernel + k_idx) * kPatchW + w_chunk * kChunkSize;  
+    // global input offset
+    const size_t offset = ((static_cast<size_t>(b_idx * kNumC + 0) * kPatchT + t_idx) * kPatchH + static_cast<size_t>(h_idx)) * kPatchW + static_cast<size_t>(w_chunk * kChunkSize);
 
-      // low edge
-      if (h_idx == 0) {
-        #pragma unroll
-        for (int w_idx = 0; w_idx < 5; ++w_idx) {
-          #pragma unroll
-          for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-            const int base = t_idx * 3 * kPatchW + w_idx * 64 + tx;
-            const int offset = (((b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + h_idx) * kPatchW + w_idx * 64 + tx;
-            tubelet[buf][base] = 0;
-            tubelet[buf][base + kPatchW] = input[offset];
-            tubelet[buf][base + 2 * kPatchW] = input[offset + kPatchW];
-          }
-        }
-      } 
-      // high edge
-      else if (h_idx == kPatchH - 1) {
-        #pragma unroll
-        for (int w_idx = 0; w_idx < 5; ++w_idx) {
-          #pragma unroll
-          for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-            const int base = t_idx * 3 * kPatchW + w_idx * 64 + tx;
-            const int offset = (((b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + h_idx) * kPatchW + w_idx * 64 + tx;
-            tubelet[buf][base] = input[offset - kPatchW];
-            tubelet[buf][base + kPatchW] = input[offset];
-            tubelet[buf][base + 2 * kPatchW] = 0;
-          }
-        }  
-      } 
-      // middle
-      else {
-        #pragma unroll
-        for (int w_idx = 0; w_idx < 5; ++w_idx) {
-          #pragma unroll
-          for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-            const int base = t_idx * 3 * kPatchW + w_idx * 64 + tx;
-            const int offset = (((b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + h_idx) * kPatchW + w_idx * 64 + tx;
-            tubelet[buf][base] = input[offset - kPatchW];
-            tubelet[buf][base + kPatchW] = input[offset];
-            tubelet[buf][base + 2 * kPatchW] = input[offset + kPatchW];
-          }
-        }  
-      }
+    if (h_idx < 0 || h_idx >= kPatchH) {
+      // zero pad when h_idx is out of bounds
+      *reinterpret_cast<int4*>(&tubelet[0][base]) = make_int4(0, 0, 0, 0);
+    } else {
+      // load from global to lds
+      // *reinterpret_cast<int4*>(&tubelet[0][base]) = *reinterpret_cast<const int4*>(&input[offset]);
+      async_global_to_lds_4b(&tubelet[0][base + 0],  input, offset + 0);
+      async_global_to_lds_4b(&tubelet[0][base + 4],  input, offset + 4);
+      async_global_to_lds_4b(&tubelet[0][base + 8],  input, offset + 8);
+      async_global_to_lds_4b(&tubelet[0][base + 12], input, offset + 12);
+    }
+  } // producer prolog
+  asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)");
+  __syncthreads();
 
-      // release buffer semaphore
-      if (wave_tx == 0) {
-        __atomic_store_n(&buf_semaphore[buf], 4, __ATOMIC_RELEASE);
-      }
-    } // cin_idx
-
-  } // producer
-  else 
-  { // consumer x4
-
-    // loop over all 128 input channels
-    for (int cin_idx = 0; cin_idx < kNumC; ++cin_idx) {
+  //////////////////////////////////////////////////////////////
+  // main producer loop: 128 input channels
+  if (tx >= kPatchW) {
+    for (int cin_idx = 1; cin_idx < kNumC; ++cin_idx) {
       const int buf = cin_idx % 2;
 
-      // acquire buffer semaphore
-      if (wave_tx == 0) {
-        while (__atomic_load_n(&buf_semaphore[buf], __ATOMIC_ACQUIRE) == 0) { __builtin_amdgcn_s_sleep(1); }
-      }
+      // producer ongoing
+      const int w_chunk = wave_tx % kChunksPerPatchW;
+      const int k_idx   = (wave_tx / kChunksPerPatchW) % kKernel;
+      const int h_idx   = h_ctr_idx + k_idx - 1;
+
+      if (wave_tx == 0) { while (__atomic_load_n(&sema[buf], __ATOMIC_RELAXED) > 0) { __builtin_amdgcn_s_sleep(8); } }
       __builtin_amdgcn_wave_barrier();
+
+      if (wave_tx < kNumProducerThreads) {
+        // lds base address
+        const int base =  k_idx * kPatchW + w_chunk * kChunkSize;  
+        // global input offset
+        const size_t offset = ((static_cast<size_t>(b_idx * kNumC + cin_idx) * kPatchT) * kPatchH + static_cast<size_t>(h_idx)) * kPatchW + static_cast<size_t>(w_chunk * kChunkSize);
+
+        if (h_idx < 0 || h_idx >= kPatchH) {
+          // zero pad when h_idx is out of bounds
+          *reinterpret_cast<int4*>(&tubelet[buf][base]) = make_int4(0, 0, 0, 0);
+          *reinterpret_cast<int4*>(&tubelet[buf][base + kKernel * kPatchW]) = make_int4(0, 0, 0, 0);
+          *reinterpret_cast<int4*>(&tubelet[buf][base + 2 * kKernel * kPatchW]) = make_int4(0, 0, 0, 0);
+          *reinterpret_cast<int4*>(&tubelet[buf][base + 3 * kKernel * kPatchW]) = make_int4(0, 0, 0, 0);
+        } else {
+          // load from global to lds
+          // *reinterpret_cast<int4*>(&tubelet[buf][base]) = *reinterpret_cast<const int4*>(&input[offset]);
+          // *reinterpret_cast<int4*>(&tubelet[buf][base + kKernel * kPatchW]) = *reinterpret_cast<const int4*>(&input[offset + kPatchH * kPatchW]);
+          // *reinterpret_cast<int4*>(&tubelet[buf][base + 2 * kKernel * kPatchW]) = *reinterpret_cast<const int4*>(&input[offset + 2 * kPatchH * kPatchW]);
+          // *reinterpret_cast<int4*>(&tubelet[buf][base + 3 * kKernel * kPatchW]) = *reinterpret_cast<const int4*>(&input[offset + 3 * kPatchH * kPatchW]);
+          async_global_to_lds_4b(&tubelet[buf][base + 0],  input, offset + 0);
+          async_global_to_lds_4b(&tubelet[buf][base + 4],  input, offset + 4);
+          async_global_to_lds_4b(&tubelet[buf][base + 8],  input, offset + 8);
+          async_global_to_lds_4b(&tubelet[buf][base + 12], input, offset + 12);
+          async_global_to_lds_4b(&tubelet[buf][base + kKernel * kPatchW + 0],  input, offset + kPatchH * kPatchW + 0);
+          async_global_to_lds_4b(&tubelet[buf][base + kKernel * kPatchW + 4],  input, offset + kPatchH * kPatchW + 4);
+          async_global_to_lds_4b(&tubelet[buf][base + kKernel * kPatchW + 8],  input, offset + kPatchH * kPatchW + 8);
+          async_global_to_lds_4b(&tubelet[buf][base + kKernel * kPatchW + 12], input, offset + kPatchH * kPatchW + 12);
+          async_global_to_lds_4b(&tubelet[buf][base + 2 * kKernel * kPatchW + 0],  input, offset + 2 * kPatchH * kPatchW + 0);
+          async_global_to_lds_4b(&tubelet[buf][base + 2 * kKernel * kPatchW + 4],  input, offset + 2 * kPatchH * kPatchW + 4);
+          async_global_to_lds_4b(&tubelet[buf][base + 2 * kKernel * kPatchW + 8],  input, offset + 2 * kPatchH * kPatchW + 8);
+          async_global_to_lds_4b(&tubelet[buf][base + 2 * kKernel * kPatchW + 12], input, offset + 2 * kPatchH * kPatchW + 12);
+          async_global_to_lds_4b(&tubelet[buf][base + 3 * kKernel * kPatchW + 0],  input, offset + 3 * kPatchH * kPatchW + 0);
+          async_global_to_lds_4b(&tubelet[buf][base + 3 * kKernel * kPatchW + 4],  input, offset + 3 * kPatchH * kPatchW + 4);
+          async_global_to_lds_4b(&tubelet[buf][base + 3 * kKernel * kPatchW + 8],  input, offset + 3 * kPatchH * kPatchW + 8);
+          async_global_to_lds_4b(&tubelet[buf][base + 3 * kKernel * kPatchW + 12], input, offset + 3 * kPatchH * kPatchW + 12);         }
+      }
+
+      asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)");
+      if (wave_tx == 0) { __atomic_store_n(&sema[buf], 5, __ATOMIC_RELEASE); }
+      __builtin_amdgcn_wave_barrier();
+    } // cin_idx loop
+  } // main producer loop
+
+  //////////////////////////////////////////////////////////////
+  // main consumer loop: 128 input channels
+  if (tx < kPatchW) {
+    for (int cin_idx = 0; cin_idx < kNumC; ++cin_idx) {
+      const int buf = cin_idx % 2;
+
+      if (wave_tx == 0) { while (__atomic_load_n(&sema[buf], __ATOMIC_ACQUIRE) == 0) { __builtin_amdgcn_s_sleep(1); } }
+      __builtin_amdgcn_wave_barrier();
+      asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)");
 
       // temporary accumulators assignment (sum all)
       const int cout_idx = cin_idx % kChannelsPerOutGroup;
       #pragma unroll
       for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
         const int base = t_idx * kPatchW + tx;
-        const int offset = t_idx * 3 * kPatchW + tx;
+        const int offset = t_idx * kKernel * kPatchW + tx;
         accumulators[cout_idx][base] += (tubelet[buf][offset] + tubelet[buf][offset + kPatchW] + tubelet[buf][offset + 2 * kPatchW]);
       }
-      const int base = (wave_idx - 1) * kPatchW + wave_tx;
-      const int offset = (wave_idx - 1) * 3 * kPatchW + wave_tx;
-      accumulators[cout_idx][base] += (tubelet[buf][offset] + tubelet[buf][offset + kPatchW] + tubelet[buf][offset + 2 * kPatchW]);
 
-      // release buffer semaphore
-      if (wave_tx == 0) {
-        __atomic_fetch_add(&buf_semaphore[buf], -1, __ATOMIC_RELEASE);
-      }
-    } // cin_idx
+      if (wave_tx == 0) { __atomic_fetch_sub(&sema[buf], 1, __ATOMIC_RELAXED); }
+      __builtin_amdgcn_wave_barrier();
+    } // cin_idx loop
+  } // main consumer loop
 
-    // loop over 16 output channels
+  //////////////////////////////////////////////////////////////
+  // output loop: 16 output channels
+  if(tx < kPatchW) {
     #pragma unroll
     for (int cout_idx = 0; cout_idx < kChannelsPerOutGroup; ++cout_idx) {
       // store accumulators to global
       #pragma unroll
       for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-        const int base = (((b_idx * kNumC + outgrp_idx * kChannelsPerOutGroup + cout_idx) * kPatchT + t_idx) * kPatchH + h_idx) * kPatchW + tx;
+        const int base = (((b_idx * kNumC + outgrp_idx * kChannelsPerOutGroup + cout_idx) * kPatchT + t_idx) * kPatchH + h_ctr_idx) * kPatchW + tx;
         const int offset = t_idx * kPatchW + tx;
         output[base] = accumulators[cout_idx][offset];
       }
-      const int base = (((b_idx * kNumC + outgrp_idx * kChannelsPerOutGroup + cout_idx) * kPatchT + wave_idx - 1) * kPatchH + h_idx) * kPatchW + wave_tx;
-      const int offset = (wave_idx - 1) * kPatchW + wave_tx;
-      output[base] = accumulators[cout_idx][offset];
-    } // cout_idx
-
-  } // consumer
+    } // cout_idx loop
+  } // output loop
 
 } // conv3d_my_global_lds_kernel
 } // namespace
