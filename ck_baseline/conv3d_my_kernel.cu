@@ -30,35 +30,16 @@ constexpr int kChannelsPerOutGroup = kMFMAOutputDim; // 16
 
 namespace {
 
-typedef int v4i32 __attribute__((vector_size(16)));
-
-extern "C" __device__ void llvm_amdgcn_raw_buffer_load_lds(
-  v4i32 rsrc,
-  uint32_t __attribute__((address_space(3)))* lds,
-  uint32_t size,
-  uint32_t voff,
-  uint32_t soff,
-  uint32_t imm,
-  uint32_t aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
-
-__device__ inline void async_global_to_lds_4b(char* smem, const char* base, size_t global_offset) {
-  struct __attribute__((packed)) { 
-    const void* ptr; 
-    uint32_t range; 
-    uint32_t config; 
-  } br{base + global_offset, 0xffffffffu, 0x00020000u};
-  
-  llvm_amdgcn_raw_buffer_load_lds(
-    __builtin_bit_cast(v4i32, br),                                // RSRC Descriptor
-    (uint32_t __attribute__((address_space(3)))*)(uintptr_t)smem, // LDS Dest (Space 3)
-    4u, // Size: 4 bytes
-    0u, // voffset: 0 (since addr is in rsrc)
-    0u, // soffset: 0
-    0u, // imm offset: 0
-    0u  // aux: 0
-  );
+__device__ inline void async_global_to_lds_4b(
+  char __attribute__((address_space(3)))* smem_dst,
+  const char __attribute__((address_space(1)))* global_src) {
+  __builtin_amdgcn_global_load_lds(
+      (const void __attribute__((address_space(1)))*)global_src,
+      (void __attribute__((address_space(3)))*)smem_dst,
+      4u,
+      0u,
+      0u);
 }
-
 
 __global__ void conv3d_my_global_lds_kernel(
   const char* __restrict__ input,
@@ -107,7 +88,9 @@ __global__ void conv3d_my_global_lds_kernel(
     } else {
       // load from global to lds
       const size_t iptr = ((static_cast<size_t>(b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + static_cast<size_t>(h_idx)) * kPatchW + static_cast<size_t>(w_chunk * 4);
-      async_global_to_lds_4b(&tubelet[buf][tptr], input, iptr);
+      async_global_to_lds_4b(
+          (char __attribute__((address_space(3)))*)&tubelet[buf][tptr],
+          (const char __attribute__((address_space(1)))*)(input + iptr));
     }
   }
 
@@ -137,7 +120,9 @@ __global__ void conv3d_my_global_lds_kernel(
       } else {
         // load from global to lds
         const size_t iptr = ((static_cast<size_t>(b_idx * kNumC + cin_idx) * kPatchT + t_idx) * kPatchH + static_cast<size_t>(h_idx)) * kPatchW + static_cast<size_t>(w_chunk * 4);
-        async_global_to_lds_4b(&tubelet[buf][tptr], input, iptr);
+        async_global_to_lds_4b(
+          (char __attribute__((address_space(3)))*)&tubelet[buf][tptr],
+          (const char __attribute__((address_space(1)))*)(input + iptr));
       }
     }
 
