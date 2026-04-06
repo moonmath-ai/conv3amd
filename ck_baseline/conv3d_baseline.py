@@ -8,7 +8,7 @@ No bias in the extension; ``bias=`` on the module is accepted for API compatibil
 Example::
 
     layer = CausalConv3dFP8(128, 128, 3, padding=1).cuda().to(torch.float8_e4m3fn)
-    x = torch.randn(B, 128, 4, 192, 320, device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    x = torch.randn(B, 128, 4, 192, 256, device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
     y = layer(x)
 """
 
@@ -27,14 +27,14 @@ STAGE0_KERNEL_SIZE = (3, 3, 3)
 # Spatial layout for x: (B, C, T, H, W)
 STAGE0_T = 4
 STAGE0_H = 192
-STAGE0_W = 320
+STAGE0_W = 256
 
 # OCP float8 e4m3fn only (no bf16 / e5m2 in this baseline).
 FLOAT8_E4M3FN = torch.float8_e4m3fn
 
 
 def _verify_stage0_io(x: torch.Tensor, weight: torch.Tensor, *, ctx: str) -> None:
-    """Require weight (128,128,3,3,3) and x (B,128,4,192,320) with B >= 1."""
+    """Require weight (128,128,3,3,3) and x (B,128,4,192,256) with B >= 1."""
     exp_w = (STAGE0_OUT_CHANNELS, STAGE0_IN_CHANNELS, *STAGE0_KERNEL_SIZE)
     if tuple(weight.shape) != exp_w:
         raise ValueError(
@@ -98,7 +98,7 @@ class CausalConv3dFP8(nn.Module):
     """3D conv, float8_e4m3fn only. ``padding`` / ``bias`` are ignored (API compatibility only).
 
     Stage 0: ``in_channels`` / ``out_channels`` must be 128, ``kernel_size`` must be 3,
-    and forward input ``x`` must be ``(B, 128, 4, 192, 320)`` with ``B >= 1``.
+    and forward input ``x`` must be ``(B, 128, 4, 192, 256)`` with ``B >= 1``.
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, padding=1, bias=True):

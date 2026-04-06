@@ -42,7 +42,7 @@ def main() -> int:
     # -------------------------------------------------------------------------
     p = argparse.ArgumentParser(description="CausalConv3d stage 0.")
     p.add_argument("--H", type=int, default=192, help="Height")
-    p.add_argument("--W", type=int, default=320, help="Width")
+    p.add_argument("--W", type=int, default=256, help="Width")
     p.add_argument("--T", type=int, default=4, help="Time (4 = stage 0 chunk)")
     p.add_argument("--batch", type=int, default=1, help="Batch size")
     p.add_argument("--channels", "-c", type=int, default=128, help="Channels (128 = stage 0)")

@@ -33,7 +33,7 @@ Calls into ck_baseline:
 **`forward(x)`:**
 
 1. `_require_float8_e4m3fn(x, self.weight)`
-2. `_verify_stage0_io(...)` — fixed `(B,128,4,192,320)` and weight shape
+2. `_verify_stage0_io(...)` — fixed `(B,128,4,192,256)` and weight shape
 3. `return impl.conv3d_fp8_forward(x, self.weight)`
 
 ### 2.3 `conv3d_my.cpp` — `conv3d_fp8_forward`

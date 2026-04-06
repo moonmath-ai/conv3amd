@@ -17,22 +17,21 @@ constexpr int kMFMAInternalDim = 32;
 constexpr int kNumC = 128;
 constexpr int kPatchT = 4;
 constexpr int kPatchH = 192;
-constexpr int kPatchW = 320;
-constexpr int kPatchWDiv4 = kPatchW / 4; // 80
-constexpr int kPatchWDiv16 = kPatchW / 16; // 20
+constexpr int kPatchW = 256;
+constexpr int kPatchWDiv4 = kPatchW / 4; // 64
+constexpr int kPatchWDiv16 = kPatchW / 16; // 16
 constexpr int kKernel = 3;
 constexpr int kFilter = 27; // kKernel * kKernel * kKernel = 27
 
-constexpr int kBlockSize = kPatchW;
+constexpr int kBlockSize = 256;
 constexpr int kChannelsPerOutGroup = kMFMAOutputDim; // 16
 
 // constexpr int kFilterPadded = kMFMAInternalDim; // 32
-// constexpr int kPatchWPerMFMAExe = kPatchW / kMFMAInputDim; // 20
+// constexpr int kPatchWPerMFMAExe = kPatchW / kMFMAInputDim; // 16
 // constexpr int kFiltersLoadedInFirstTxWave = 11; // 11 * kFilter = 297 <= kBlockSize
 
 namespace {
 
-// 4 B global→LDS (__builtin_amdgcn_global_load_lds / llvm.amdgcn.global.load.lds); gfx942 path.
 __device__ inline void async_global_to_lds_4b(
   char __attribute__((address_space(3)))* smem_dst,
   const char __attribute__((address_space(1)))* global_src) {
@@ -43,7 +42,6 @@ __device__ inline void async_global_to_lds_4b(
       0u,
       0u);
 }
-
 
 __global__ void conv3d_my_global_lds_kernel(
   const char* __restrict__ input,
@@ -137,9 +135,12 @@ __global__ void conv3d_my_global_lds_kernel(
     // consume current buf
     const int cout_idx = curr_cin_idx % kChannelsPerOutGroup;
     #pragma unroll
-    for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-      const int aptr = t_idx * kPatchW + tx;
-      const int tptr = t_idx * kKernel * kPatchW + tx;
+    for (int i = tx; i < kPatchT * kPatchW; i += kBlockSize) {
+      const int w_idx = i % kPatchW;
+      const int t_idx = i / kPatchW;
+
+      const int aptr = t_idx * kPatchW + w_idx;
+      const int tptr = t_idx * kKernel * kPatchW + w_idx;
       accumulators[cout_idx][aptr] += (tubelet[curr_buf][tptr] + tubelet[curr_buf][tptr + kPatchW] + tubelet[curr_buf][tptr + 2 * kPatchW]);
     }
   } // cin_idx loop
@@ -150,9 +151,12 @@ __global__ void conv3d_my_global_lds_kernel(
   asm volatile("s_barrier" ::: "memory");
   const int cout_idx = cin_idx % kChannelsPerOutGroup;
   #pragma unroll
-  for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-    const int aptr = t_idx * kPatchW + tx;
-    const int tptr = t_idx * kKernel * kPatchW + tx;
+  for (int i = tx; i < kPatchT * kPatchW; i += kBlockSize) {
+    const int w_idx = i % kPatchW;
+    const int t_idx = i / kPatchW;
+
+    const int aptr = t_idx * kPatchW + w_idx;
+    const int tptr = t_idx * kKernel * kPatchW + w_idx;
     accumulators[cout_idx][aptr] += (tubelet[buf][tptr] + tubelet[buf][tptr + kPatchW] + tubelet[buf][tptr + 2 * kPatchW]);
   }
 
@@ -162,10 +166,13 @@ __global__ void conv3d_my_global_lds_kernel(
   for (int cout_idx = 0; cout_idx < kChannelsPerOutGroup; ++cout_idx) {
     // store accumulators to global
     #pragma unroll
-    for (int t_idx = 0; t_idx < kPatchT; ++t_idx) {
-      const int base = (((b_idx * kNumC + outgrp_idx * kChannelsPerOutGroup + cout_idx) * kPatchT + t_idx) * kPatchH + h_ctr_idx) * kPatchW + tx;
-      const int offset = t_idx * kPatchW + tx;
-      output[base] = accumulators[cout_idx][offset];
+    for (int i = tx; i < kPatchT * kPatchWDiv4; i += kBlockSize) {
+      const int w_chunk = i % kPatchWDiv4;
+      const int t_idx   = i / kPatchWDiv4;
+  
+      const int optr = (((b_idx * kNumC + outgrp_idx * kChannelsPerOutGroup + cout_idx) * kPatchT + t_idx) * kPatchH + h_ctr_idx) * kPatchW + w_chunk * 4;
+      const int aptr = t_idx * kPatchW + w_chunk * 4;
+      *reinterpret_cast<int*>(&output[optr]) = *reinterpret_cast<int*>(&accumulators[cout_idx][aptr]);
     }
   } // cout_idx loop
 

@@ -28,10 +28,10 @@ from conv3d_baseline import CausalConv3dFP8
 device = torch.device("cuda", 0)
 dtype = torch.float8_e4m3fn
 model = CausalConv3dFP8(128, 128, 3, padding=1).to(device, dtype)
-x = torch.randn(1, 128, 4, 192, 320, device=device, dtype=torch.float32).to(dtype)
+x = torch.randn(1, 128, 4, 192, 256, device=device, dtype=torch.float32).to(dtype)
 with torch.no_grad():
     y = model(x)
-print(y.shape)  # (1, 128, 4, 192, 320)
+print(y.shape)  # (1, 128, 4, 192, 256)
 ```
 
 ## Replacing with your own kernel
